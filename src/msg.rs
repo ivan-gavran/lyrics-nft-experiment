@@ -1,14 +1,30 @@
 use cosmwasm_schema::{cw_serde, QueryResponses};
+use cosmwasm_std::{Addr, Uint128};
+use cw721_base::Extension;
 
 #[cw_serde]
 pub struct InstantiateMsg {
-    pub count: i32,
+    pub owner: Addr,     
+    pub guessing_fee: Uint128,
+    pub name: String,
+    pub symbol: String,
+    pub token_uri: String,
+    pub extension: Extension,
+    pub next_available_token_id: u32,
+    pub token_code_id: u64
 }
 
 #[cw_serde]
 pub enum ExecuteMsg {
-    Increment {},
-    Reset { count: i32 },
+    CreateNFT{
+        hash: u64,
+        url: String
+    },
+    Guess{
+        nft_id: u32,
+        lyrics: String
+    }
+    
 }
 
 #[cw_serde]

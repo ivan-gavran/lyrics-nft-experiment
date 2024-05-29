@@ -1,34 +1,97 @@
 #[cfg(not(feature = "library"))]
 use cosmwasm_std::entry_point;
-use cosmwasm_std::{to_json_binary, Binary, Deps, DepsMut, Env, MessageInfo, Response, StdResult};
+use cosmwasm_std::{to_json_binary, Addr, Binary, Deps, DepsMut, Empty, Env, MessageInfo, ReplyOn, 
+                    Response, StdResult, SubMsg, WasmMsg, Reply
+                };
 use cw2::set_contract_version;
+use cw721_base::ExecuteMsg as Cw721ExecuteMsg;
+use cw721_base::{
+    Extension,
+    msg::InstantiateMsg as Cw721InstantiateMsg
+};
 
 use crate::error::ContractError;
 use crate::msg::{ExecuteMsg, GetCountResponse, InstantiateMsg, QueryMsg};
-use crate::state::{State, STATE};
+use crate::state::{Config, CONFIG};
+use std::collections::HashMap;
+use std::hash::{DefaultHasher, Hash, Hasher};
+use cw_utils::parse_instantiate_response_data;
 
 // version info for migration info
 const CONTRACT_NAME: &str = "crates.io:lyrics-nft";
 const CONTRACT_VERSION: &str = env!("CARGO_PKG_VERSION");
+const DENOM: &str = "udenom";
+const INSTANTIATE_TOKEN_REPLY_ID: u64 = 1;
+
 
 #[cfg_attr(not(feature = "library"), entry_point)]
 pub fn instantiate(
     deps: DepsMut,
-    _env: Env,
+    env: Env,
     info: MessageInfo,
     msg: InstantiateMsg,
 ) -> Result<Response, ContractError> {
-    let state = State {
-        count: msg.count,
+
+
+    let config = Config { 
+        cw721_address: None,       
         owner: info.sender.clone(),
+        nft_ids: HashMap::new(),        
+        guessing_fee: msg.guessing_fee,
+        name: msg.name,
+        symbol: msg.symbol,
+        token_uri: msg.token_uri,
+        extension: msg.extension,
+        next_available_token_id: 0
     };
     set_contract_version(deps.storage, CONTRACT_NAME, CONTRACT_VERSION)?;
-    STATE.save(deps.storage, &state)?;
+    CONFIG.save(deps.storage, &config)?;    
 
-    Ok(Response::new()
-        .add_attribute("method", "instantiate")
-        .add_attribute("owner", info.sender)
-        .add_attribute("count", msg.count.to_string()))
+    let sub_msg: Vec<SubMsg> = vec![
+        SubMsg {
+            msg: WasmMsg::Instantiate {
+                code_id: msg.token_code_id,
+                msg: to_json_binary(&Cw721InstantiateMsg {
+                    name: msg.name.clone(),
+                    symbol: msg.symbol,
+                    minter: env.contract.address.to_string(),
+                })?,
+                funds: vec![],
+                admin: None,
+                label: String::from("Instantiate the NFT contract"),
+            }
+            .into(),
+            id: INSTANTIATE_TOKEN_REPLY_ID,
+            gas_limit: None,
+            reply_on: ReplyOn::Success,
+            payload: to_json_binary(&"")?,
+        }
+    ];
+
+    Ok(Response::new().add_submessages(sub_msg))    
+}
+
+// Reply callbacks (here, only for the instantiate token reply)
+#[cfg_attr(not(feature = "library"), entry_point)]
+pub fn reply(deps: DepsMut, _env: Env, reply: Reply) -> Result<Response, ContractError> {
+    match reply.id {
+        INSTANTIATE_TOKEN_REPLY_ID => {
+            
+            let mut config = CONFIG.load(deps.storage)?;
+
+            if config.cw721_address.is_some() {
+                return Err(ContractError::NFTContractALreadyLinked {});
+            }
+
+            let reply = parse_instantiate_response_data(reply).unwrap();
+            config.cw721_address = Addr::unchecked(reply.contract_address).into();
+
+            
+            CONFIG.save(deps.storage, &config)?;
+            Ok(Response::new())
+        }
+        _ => Err(ContractError::UnknownReplyId { reply_id: reply.id }),
+    }
 }
 
 #[cfg_attr(not(feature = "library"), entry_point)]
@@ -39,32 +102,79 @@ pub fn execute(
     msg: ExecuteMsg,
 ) -> Result<Response, ContractError> {
     match msg {
-        ExecuteMsg::Increment {} => execute::increment(deps),
-        ExecuteMsg::Reset { count } => execute::reset(deps, info, count),
+        ExecuteMsg::CreateNFT { hash, url  } => execute::create_nft(deps, info.sender, hash, url),
+        ExecuteMsg::Guess { nft_id, lyrics } => execute::guess(deps, info.sender, info.funds, nft_id, lyrics),
+        
     }
 }
 
 pub mod execute {
+    use cosmwasm_std::Coin;
+
     use super::*;
 
-    pub fn increment(deps: DepsMut) -> Result<Response, ContractError> {
-        STATE.update(deps.storage, |mut state| -> Result<_, ContractError> {
-            state.count += 1;
-            Ok(state)
-        })?;
+    pub fn create_nft(deps: DepsMut, sender: Addr, hash: u64, url: String) -> Result<Response, ContractError> {        
+        let mut config = CONFIG.load(deps.storage)?;
 
-        Ok(Response::new().add_attribute("action", "increment"))
+        if config.owner != sender {
+            return Err(ContractError::Unauthorized {});
+        }
+
+        config.nft_ids.insert(config.next_available_token_id, hash);
+        config.next_available_token_id += 1;
+
+
+        // mint the NFT
+        let mint_msg = Cw721ExecuteMsg::<Extension, Empty>::Mint {
+            token_id: config.next_available_token_id.to_string(),
+            owner: sender.to_string(),
+            token_uri: Some(url),
+            extension: config.extension.clone(),
+        };
+
+
+        CONFIG.save(deps.storage, &config)?;
+
+        Ok(Response::new().add_attribute("action", "create_nft"))
     }
 
-    pub fn reset(deps: DepsMut, info: MessageInfo, count: i32) -> Result<Response, ContractError> {
-        STATE.update(deps.storage, |mut state| -> Result<_, ContractError> {
-            if info.sender != state.owner {
-                return Err(ContractError::Unauthorized {});
-            }
-            state.count = count;
-            Ok(state)
-        })?;
-        Ok(Response::new().add_attribute("action", "reset"))
+    pub fn guess(deps: DepsMut, sender: Addr, funds: Vec<Coin>, nft_id: u32, lyrics: String) -> Result<Response, ContractError> {
+        
+        // check if the funds are paid in the right denom and the right amount
+        if funds.len() != 1 {
+            return Err(ContractError::InvalidFunds {});
+        }
+
+        if funds[0].denom != DENOM {
+            return Err(ContractError::InvalidFunds {});
+        }
+
+        if funds[0].amount < CONFIG.load(deps.storage)?.guessing_fee {
+            return Err(ContractError::InvalidFunds {});
+        }
+
+        
+
+        let config = CONFIG.load(deps.storage)?;
+
+        let hash = *config.nft_ids.get(&nft_id).ok_or(ContractError::NFTNotFound {})?;
+        
+
+        let mut hasher = DefaultHasher::new();
+        lyrics.hash(&mut hasher);
+        let lyrics_hash = hasher.finish();
+
+        if hash != lyrics_hash {
+            return Err(ContractError::IncorrectLyrics {});
+        }
+
+        // transfer the NFT to the new owner
+        let transfer_msg = Cw721ExecuteMsg::<Extension, Empty>::TransferNft {
+            recipient: sender.to_string(),
+            token_id: nft_id.to_string(),
+        };
+
+        Ok(Response::new().add_attribute("action", "guess"))
     }
 }
 
@@ -79,7 +189,7 @@ pub mod query {
     use super::*;
 
     pub fn count(deps: Deps) -> StdResult<GetCountResponse> {
-        let state = STATE.load(deps.storage)?;
+        let state = CONFIG.load(deps.storage)?;
         Ok(GetCountResponse { count: state.count })
     }
 }
